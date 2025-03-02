@@ -284,10 +284,49 @@ func (r *DRClusterConfigReconciler) processCreateOrUpdate(
 		return ctrl.Result{Requeue: true}, err
 	}
 
+	if err := r.validateS3Profiles(ctx, log); err != nil {
+		log.Info("Reconcile error", "error", err)
+		setDRClusterConfigConfigurationProcessedCondition(&drCConfig.Status.Conditions, drCConfig.Generation,
+			err.Error(), metav1.ConditionFalse)
+
+		return ctrl.Result{Requeue: true}, err
+	}
+
 	setDRClusterConfigConfigurationProcessedCondition(&drCConfig.Status.Conditions, drCConfig.Generation,
 		"Configuration processed and validated", metav1.ConditionTrue)
 
 	return ctrl.Result{}, nil
+}
+
+func (r *DRClusterConfigReconciler) validateS3Profiles(ctx context.Context, log logr.Logger) error {
+	drclusters := &ramen.DRClusterList{}
+	if err := r.Client.List(ctx, drclusters); err != nil {
+		log.Error(err, "Failed to list DRClusters")
+
+		return err
+	}
+
+	for i := range drclusters.Items {
+		drcluster := &drclusters.Items[i]
+
+		s3ProfileName := drcluster.Spec.S3ProfileName
+
+		if s3ProfileName == NoS3StoreAvailable {
+			continue
+		}
+
+		s3StoreProfile, err := GetRamenConfigS3StoreProfile(context.TODO(), r.Client, s3ProfileName)
+		if err != nil {
+			log.Info("Failed to validate s3 profile", "s3 profile", s3ProfileName, "drcluster", drcluster.Name, "reason", err.Error())
+
+			continue
+		}
+
+		if len(s3StoreProfile.S3SecretRef.Name) > 0 {
+			// todo: go through the validation flow of s3 profile
+
+		}
+	}
 }
 
 // CreateClassClaims creates cluster claims for various storage related classes of interest
