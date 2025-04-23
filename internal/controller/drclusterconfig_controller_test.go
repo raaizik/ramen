@@ -5,6 +5,7 @@ package controllers_test
 
 import (
 	"context"
+	corev1 "k8s.io/api/core/v1"
 	"os"
 	"path/filepath"
 	"slices"
@@ -58,6 +59,7 @@ var _ = Describe("DRClusterConfig-ClusterClaimsTests", Ordered, func() {
 		baseSC, sc1, sc2    *storagev1.StorageClass
 		baseVSC, vsc1, vsc2 *snapv1.VolumeSnapshotClass
 		baseVRC, vrc1, vrc2 *volrep.VolumeReplicationClass
+		ramenConfig         *ramen.RamenConfig
 		scs, vscs, vrcs     []string
 	)
 
@@ -90,6 +92,37 @@ var _ = Describe("DRClusterConfig-ClusterClaimsTests", Ordered, func() {
 
 		k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 		Expect(err).NotTo(HaveOccurred())
+
+		By("Creating namespaces")
+
+		Expect(k8sClient.Create(context.TODO(),
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ramenNamespace}})).To(Succeed())
+
+		By("Defining a ramen configuration")
+
+		ramenConfig = &ramen.RamenConfig{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "RamenConfig",
+				APIVersion: ramen.GroupVersion.String(),
+			},
+			LeaderElection: &config.LeaderElectionConfiguration{
+				LeaderElect:  new(bool),
+				ResourceName: ramencontrollers.HubLeaderElectionResourceName,
+			},
+			Metrics: ramen.ControllerMetrics{
+				BindAddress: "0", // Disable metrics
+			},
+			RamenControllerType: ramen.DRHubType,
+		}
+		ramenConfig.DrClusterOperator.DeploymentAutomationEnabled = true
+		ramenConfig.DrClusterOperator.S3SecretDistributionEnabled = true
+		configMap, err := ramencontrollers.ConfigMapNew(
+			ramenNamespace,
+			ramencontrollers.HubOperatorConfigMapName,
+			ramenConfig,
+		)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Create(context.TODO(), configMap)).To(Succeed())
 
 		By("starting the DRClusterConfig reconciler")
 
