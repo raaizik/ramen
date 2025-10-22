@@ -173,6 +173,8 @@ func (v *VSHandler) ReconcileRD(
 		return nil, err
 	}
 
+	v.assignRDAsOwnerToProtectedPVC(rd, rdSpec)
+
 	err = v.ReconcileServiceExportForRD(rd)
 	if err != nil {
 		return nil, err
@@ -210,6 +212,67 @@ func RDStatusReady(rd *volsyncv1alpha1.ReplicationDestination, log logr.Logger) 
 	return true
 }
 
+func (v *VSHandler) setRDAsOwnerOfPVC(
+	rd *volsyncv1alpha1.ReplicationDestination,
+	pvc *corev1.PersistentVolumeClaim,
+) error {
+	if !v.vrgInAdminNamespace {
+		// Cross-namespace: set labels only, no OwnerReference
+		labels := pvc.GetLabels()
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		labels["ramendr.openshift.io/owner-name"] = rd.Name
+		labels["ramendr.openshift.io/owner-namespace"] = rd.Namespace
+		pvc.SetLabels(labels)
+		return v.client.Update(v.ctx, pvc)
+	}
+
+	// Same namespace: safe to set OwnerReference + labels
+	ref := metav1.NewControllerRef(rd, volsyncv1alpha1.GroupVersion.WithKind("ReplicationDestination"))
+	pvc.SetOwnerReferences([]metav1.OwnerReference{*ref})
+
+	labels := pvc.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labels["ramendr.openshift.io/owner-name"] = rd.Name
+	labels["ramendr.openshift.io/owner-namespace"] = rd.Namespace
+	pvc.SetLabels(labels)
+
+	return v.client.Update(v.ctx, pvc)
+}
+
+func (v *VSHandler) assignRDAsOwnerToProtectedPVC(
+	rd *volsyncv1alpha1.ReplicationDestination,
+	rdSpec ramendrv1alpha1.VolSyncReplicationDestinationSpec,
+) error {
+	protectedPVCRef := rdSpec.ProtectedPVC
+
+	if protectedPVCRef.Name == "" || protectedPVCRef.Namespace == "" {
+		v.log.Info("No ProtectedPVC specified in ReplicationDestination spec")
+		return nil
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{}
+	key := types.NamespacedName{
+		Namespace: protectedPVCRef.Namespace,
+		Name:      protectedPVCRef.Name,
+	}
+
+	if err := v.client.Get(v.ctx, key, pvc); err != nil {
+		v.log.Error(err, "Failed to get PVC from ProtectedPVC reference", "namespace", key.Namespace, "name", key.Name)
+		return err
+	}
+
+	if err := v.setRDAsOwnerOfPVC(rd, pvc); err != nil {
+		v.log.Error(err, "Failed to assign RD ownership to PVC", "pvc", pvc.Name)
+		return err
+	}
+
+	return nil
+}
+
 //nolint:funlen
 func (v *VSHandler) createOrUpdateRD(
 	rdSpec ramendrv1alpha1.VolSyncReplicationDestinationSpec, pskSecretName string,
@@ -237,13 +300,6 @@ func (v *VSHandler) createOrUpdateRD(
 	util.AddLabel(rd, util.CreatedByRamenLabel, "true")
 
 	op, err := ctrlutil.CreateOrUpdate(v.ctx, v.client, rd, func() error {
-		if !v.vrgInAdminNamespace {
-			if err := ctrl.SetControllerReference(v.owner, rd, v.client.Scheme()); err != nil {
-				l.Error(err, "unable to set controller reference")
-
-				return fmt.Errorf("%w", err)
-			}
-		}
 
 		util.AddLabel(rd, VRGOwnerNameLabel, v.owner.GetName())
 		util.AddLabel(rd, VRGOwnerNamespaceLabel, v.owner.GetNamespace())
@@ -1239,6 +1295,63 @@ func (v *VSHandler) DeleteRS(pvcName string, pvcNamespace string) error {
 	return nil
 }
 
+func (v *VSHandler) removeRDAsOwnerFromPVC(
+	rd *volsyncv1alpha1.ReplicationDestination,
+	pvcName, pvcNamespace string,
+) error {
+	pvc := &corev1.PersistentVolumeClaim{}
+	key := types.NamespacedName{
+		Namespace: pvcNamespace,
+		Name:      pvcName,
+	}
+
+	if err := v.client.Get(v.ctx, key, pvc); err != nil {
+		v.log.Error(err, "Failed to get PVC for disowning", "pvc", key)
+		return err
+	}
+
+	updated := false
+
+	// Remove OwnerReference (only if same namespace)
+	if v.vrgInAdminNamespace {
+		newRefs := []metav1.OwnerReference{}
+		for _, ref := range pvc.OwnerReferences {
+			if !(ref.Kind == "ReplicationDestination" && ref.Name == rd.Name && ref.UID == rd.UID) {
+				newRefs = append(newRefs, ref)
+			} else {
+				updated = true
+			}
+		}
+		pvc.OwnerReferences = newRefs
+	}
+
+	// Remove tracking labels
+	labels := pvc.GetLabels()
+	if labels != nil {
+		if _, ok := labels["ramendr.openshift.io/owner-name"]; ok {
+			delete(labels, "ramendr.openshift.io/owner-name")
+			updated = true
+		}
+		if _, ok := labels["ramendr.openshift.io/owner-namespace"]; ok {
+			delete(labels, "ramendr.openshift.io/owner-namespace")
+			updated = true
+		}
+		pvc.SetLabels(labels)
+	}
+
+	if updated {
+		if err := v.client.Update(v.ctx, pvc); err != nil {
+			v.log.Error(err, "Failed to remove RD ownership from PVC", "pvc", key)
+			return err
+		}
+		v.log.Info("Removed RD ownership from PVC", "pvc", key)
+	} else {
+		v.log.Info("No RD ownership found on PVC", "pvc", key)
+	}
+
+	return nil
+}
+
 //nolint:nestif
 func (v *VSHandler) DeleteRD(pvcName string, pvcNamespace string) error {
 	// Remove a ReplicationDestination by name that is owned (by parent vrg owner)
@@ -1251,6 +1364,12 @@ func (v *VSHandler) DeleteRD(pvcName string, pvcNamespace string) error {
 		rd := currentRDListByOwner.Items[i]
 
 		if rd.GetName() == getReplicationDestinationName(pvcName) {
+			// Remove RD's ownership of PVC before deletion
+			if err := v.removeRDAsOwnerFromPVC(&rd, pvcName, pvcNamespace); err != nil {
+				v.log.Error(err, "Failed to disown PVC before deleting RD", "rd", rd.GetName())
+				// Optional: return err here if this should block RD deletion
+			}
+
 			if v.IsCopyMethodDirect() {
 				err := v.deleteLocalRDAndRS(&rd)
 				if err != nil {
